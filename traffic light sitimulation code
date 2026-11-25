@@ -1,0 +1,425 @@
+import java.io.*;
+import java.util.*;
+
+public class TrafficSignalSimulator {
+
+    static final String DATA_FILE = "traffic_signals.txt";
+
+    static final Map<String, Integer> VEHICLE_PRIORITY = new HashMap<>();
+
+    static {
+        VEHICLE_PRIORITY.put("AMBULANCE", 1);
+        VEHICLE_PRIORITY.put("FIRE", 2);
+        VEHICLE_PRIORITY.put("POLICE", 3);
+    }
+
+    static class CircularQueue {
+        private final String[] data;
+        private int head = 0;
+        private int size = 0;
+
+        CircularQueue(int capacity) {
+            data = new String[capacity];
+        }
+
+        boolean enqueue(String item) {
+            if (size == data.length) return false;
+            data[(head + size) % data.length] = item;
+            size++;
+            return true;
+        }
+
+        String dequeue() {
+            if (size == 0) return null;
+            String item = data[head];
+            data[head] = null;
+            head = (head + 1) % data.length;
+            size--;
+            return item;
+        }
+
+        String peek() {
+            return size == 0 ? null : data[head];
+        }
+
+        int size() {
+            return size;
+        }
+
+        void rotate() {
+            if (size > 1) enqueue(dequeue());
+        }
+
+        boolean rotateTo(String item) {
+            for (int i = 0; i < size; i++) {
+                if (item.equals(peek())) return true;
+                rotate();
+            }
+            return false;
+        }
+
+        List<String> toList() {
+            List<String> list = new ArrayList<>();
+            for (int i = 0; i < size; i++) list.add(data[(head + i) % data.length]);
+            return list;
+        }
+    }
+
+    static class RoadGraph {
+        private final Map<String, List<String>> adjacency = new LinkedHashMap<>();
+
+        void addRoad(String road) {
+            adjacency.putIfAbsent(road, new ArrayList<>());
+        }
+
+        boolean addConnection(String a, String b) {
+            if (a == null || b == null || a.equals(b)) return false;
+            if (!adjacency.containsKey(a) || !adjacency.containsKey(b)) return false;
+            if (!adjacency.get(a).contains(b)) adjacency.get(a).add(b);
+            if (!adjacency.get(b).contains(a)) adjacency.get(b).add(a);
+            return true;
+        }
+
+        String find(String name) {
+            if (name == null) return null;
+            for (String road : adjacency.keySet()) {
+                if (road.equalsIgnoreCase(name.trim())) return road;
+            }
+            return null;
+        }
+
+        List<String> neighbours(String road) {
+            return adjacency.getOrDefault(road, Collections.emptyList());
+        }
+
+        Set<String> roads() {
+            return adjacency.keySet();
+        }
+    }
+
+    static class EmergencyRequest {
+        final String road;
+        final String type;
+        final int priority;
+        final int seq;
+
+        EmergencyRequest(String road, String type, int seq) {
+            this.road = road;
+            this.type = type;
+            this.priority = VEHICLE_PRIORITY.get(type);
+            this.seq = seq;
+        }
+    }
+
+    static final Comparator<EmergencyRequest> URGENCY_ORDER =
+            Comparator.comparingInt((EmergencyRequest r) -> r.priority).thenComparingInt(r -> r.seq);
+
+    static class Controller {
+        final RoadGraph graph = new RoadGraph();
+        final CircularQueue phases;
+        final Map<String, String> states = new LinkedHashMap<>();
+        final PriorityQueue<EmergencyRequest> emergencies = new PriorityQueue<>(URGENCY_ORDER);
+        String current;
+        boolean started = false;
+        int seq = 0;
+
+        Controller(List<String> phaseList, List<String[]> links, String startRoad, List<String[]> pending) {
+            for (String p : phaseList) graph.addRoad(p);
+
+            if (links.isEmpty()) {
+                for (int i = 0; i < phaseList.size(); i++) {
+                    for (int j = i + 1; j < phaseList.size(); j++) {
+                        graph.addConnection(phaseList.get(i), phaseList.get(j));
+                    }
+                }
+            } else {
+                for (String[] link : links) {
+                    String a = graph.find(link[0]);
+                    String b = graph.find(link[1]);
+                    if (!graph.addConnection(a, b)) {
+                        System.out.println("Ignored invalid connection: " + link[0] + " - " + link[1]);
+                    }
+                }
+            }
+
+            phases = new CircularQueue(phaseList.size());
+            for (String p : phaseList) phases.enqueue(p);
+
+            current = graph.find(startRoad);
+            if (current == null) current = phases.peek();
+            phases.rotateTo(current);
+
+            for (String road : graph.roads()) states.put(road, "RED");
+
+            for (String[] entry : pending) {
+                String road = graph.find(entry[0]);
+                String type = entry[1].trim().toUpperCase();
+                if (road != null && VEHICLE_PRIORITY.containsKey(type)) {
+                    emergencies.add(new EmergencyRequest(road, type, seq++));
+                }
+            }
+        }
+
+        static Controller load(String path) {
+            List<String> phaseList = new ArrayList<>();
+            List<String[]> links = new ArrayList<>();
+            List<String[]> pending = new ArrayList<>();
+            String startRoad = null;
+
+            File file = new File(path);
+            if (file.exists()) {
+                try (BufferedReader br = new BufferedReader(new FileReader(file))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        line = line.trim();
+                        if (line.isEmpty() || line.startsWith("#")) continue;
+                        int eq = line.indexOf('=');
+                        if (eq < 0) continue;
+                        String key = line.substring(0, eq).trim().toUpperCase();
+                        String value = line.substring(eq + 1).trim();
+                        if (key.equals("PHASES")) {
+                            for (String p : value.split(",")) {
+                                String name = p.trim();
+                                if (!name.isEmpty() && !containsIgnoreCase(phaseList, name)) phaseList.add(name);
+                            }
+                        } else if (key.equals("CURRENT")) {
+                            startRoad = value;
+                        } else if (key.equals("CONNECTION")) {
+                            String[] parts = value.split(",");
+                            if (parts.length == 2) links.add(new String[]{parts[0].trim(), parts[1].trim()});
+                        } else if (key.equals("EMERGENCY")) {
+                            String[] parts = value.split(",");
+                            if (parts.length == 2) pending.add(new String[]{parts[0].trim(), parts[1].trim()});
+                        }
+                    }
+                } catch (IOException e) {
+                    System.out.println("Could not read " + path + ": " + e.getMessage());
+                }
+            } else {
+                System.out.println(path + " not found.");
+            }
+
+            if (phaseList.isEmpty()) {
+                System.out.println("Using default configuration: North, East, South, West.");
+                phaseList.addAll(Arrays.asList("North", "East", "South", "West"));
+                startRoad = "North";
+                links.clear();
+            }
+            return new Controller(phaseList, links, startRoad, pending);
+        }
+
+        static boolean containsIgnoreCase(List<String> list, String name) {
+            for (String s : list) if (s.equalsIgnoreCase(name)) return true;
+            return false;
+        }
+
+        boolean requireStarted() {
+            if (!started) System.out.println("Simulator is not started. Choose Start first.");
+            return started;
+        }
+
+        void start() {
+            for (String road : states.keySet()) states.put(road, "RED");
+            states.put(current, "GREEN");
+            started = true;
+            System.out.println("Simulator started.");
+            System.out.println("Signal: " + current + " GREEN");
+            if (!emergencies.isEmpty()) {
+                System.out.println("Pending emergency requests loaded from file: " + emergencies.size());
+                serveEmergencies();
+            }
+        }
+
+        void nextPhase() {
+            if (!requireStarted()) return;
+            if (!emergencies.isEmpty()) {
+                serveEmergencies();
+                return;
+            }
+            if (phases.size() == 1) {
+                System.out.println("Signal remains in the configured phase.");
+                System.out.println("Signal: " + current + " GREEN");
+                return;
+            }
+            String target = phases.toList().get(1);
+            if (safeTransition(target)) {
+                System.out.println("Signal: " + current + " GREEN");
+            }
+        }
+
+        void requestEmergency(String input) {
+            if (!requireStarted()) return;
+            if (input.trim().isEmpty()) {
+                System.out.println("No road entered. Request ignored.");
+                return;
+            }
+            int accepted = 0;
+            for (String token : input.trim().split("[\\s,]+")) {
+                if (token.isEmpty()) continue;
+                String[] parts = token.split(":");
+                String road = graph.find(parts[0]);
+                if (road == null) {
+                    System.out.println("Invalid road. Request ignored.");
+                    continue;
+                }
+                String type = parts.length > 1 ? parts[1].toUpperCase() : "AMBULANCE";
+                if (!VEHICLE_PRIORITY.containsKey(type)) {
+                    System.out.println("Invalid vehicle type. Request ignored.");
+                    continue;
+                }
+                emergencies.add(new EmergencyRequest(road, type, seq++));
+                System.out.println("Emergency request accepted: " + road + " (" + type + ")");
+                accepted++;
+            }
+            if (accepted > 0) serveEmergencies();
+        }
+
+        void serveEmergencies() {
+            while (!emergencies.isEmpty()) {
+                EmergencyRequest r = emergencies.poll();
+                System.out.println("Greedy choice: " + r.road + " (" + r.type + ")");
+                if (r.road.equals(current)) {
+                    System.out.println(current + " is already GREEN. Emergency vehicle passes.");
+                } else if (safeTransition(r.road)) {
+                    System.out.println("After a safe transition, " + r.road + " receives priority.");
+                }
+                System.out.println("Signal: " + current + " GREEN");
+            }
+        }
+
+        boolean safeTransition(String target) {
+            String from = current;
+            states.put(from, "YELLOW");
+            System.out.println(from + ": GREEN -> YELLOW");
+            states.put(from, "RED");
+            System.out.println(from + ": YELLOW -> RED");
+            if (!canTurnGreen(target)) {
+                states.put(from, "GREEN");
+                System.out.println("Transition blocked: conflicting green signal. " + from + " stays GREEN.");
+                return false;
+            }
+            states.put(target, "GREEN");
+            phases.rotateTo(target);
+            current = target;
+            return true;
+        }
+
+        boolean canTurnGreen(String road) {
+            for (String neighbour : graph.neighbours(road)) {
+                if (!"RED".equals(states.get(neighbour))) return false;
+            }
+            return true;
+        }
+
+        int countGreen() {
+            int count = 0;
+            for (String s : states.values()) if (s.equals("GREEN")) count++;
+            return count;
+        }
+
+        void status() {
+            System.out.println("------------- STATUS -------------");
+            System.out.println("Started       : " + (started ? "Yes" : "No"));
+            System.out.println("Phase order   : " + String.join(" -> ", phases.toList()) + " -> (repeat)");
+            if (started) {
+                System.out.println("Current GREEN : " + current);
+            }
+            for (Map.Entry<String, String> e : states.entrySet()) {
+                System.out.println("  " + e.getKey() + ": " + e.getValue());
+            }
+            System.out.println("Road connections:");
+            for (String road : graph.roads()) {
+                System.out.println("  " + road + " <-> " + String.join(", ", graph.neighbours(road)));
+            }
+            List<EmergencyRequest> pending = new ArrayList<>(emergencies);
+            pending.sort(URGENCY_ORDER);
+            if (pending.isEmpty()) {
+                System.out.println("Pending emergencies: none");
+            } else {
+                System.out.println("Pending emergencies:");
+                for (EmergencyRequest r : pending) System.out.println("  " + r.road + " (" + r.type + ")");
+            }
+            if (started) {
+                System.out.println("Conflict check: " + (countGreen() <= 1 ? "OK (no conflicting greens)" : "CONFLICT"));
+            }
+            System.out.println("----------------------------------");
+        }
+
+        void save(String path) {
+            try (PrintWriter out = new PrintWriter(new FileWriter(path))) {
+                out.println("PHASES=" + String.join(",", phases.toList()));
+                out.println("CURRENT=" + current);
+                Set<String> written = new HashSet<>();
+                for (String a : graph.roads()) {
+                    for (String b : graph.neighbours(a)) {
+                        String key = a.compareTo(b) < 0 ? a + "," + b : b + "," + a;
+                        if (written.add(key)) out.println("CONNECTION=" + key);
+                    }
+                }
+                List<EmergencyRequest> pending = new ArrayList<>(emergencies);
+                pending.sort(URGENCY_ORDER);
+                for (EmergencyRequest r : pending) out.println("EMERGENCY=" + r.road + "," + r.type);
+                System.out.println("State saved to " + path);
+            } catch (IOException e) {
+                System.out.println("Could not save state: " + e.getMessage());
+            }
+        }
+    }
+
+    static void printMenu() {
+        System.out.println();
+        System.out.println("=== Traffic Signal Simulator ===");
+        System.out.println("1. Start simulator");
+        System.out.println("2. Next phase");
+        System.out.println("3. Emergency request");
+        System.out.println("4. Status display");
+        System.out.println("5. Exit");
+        System.out.print("Enter choice: ");
+    }
+
+    public static void main(String[] args) {
+        Controller controller = Controller.load(DATA_FILE);
+        Scanner sc = new Scanner(System.in);
+
+        boolean running = true;
+        while (running) {
+            printMenu();
+            if (!sc.hasNextLine()) break;
+            String choice = sc.nextLine().trim().toLowerCase();
+            System.out.println();
+
+            switch (choice) {
+                case "1":
+                case "start":
+                    controller.start();
+                    break;
+                case "2":
+                case "next":
+                    controller.nextPhase();
+                    break;
+                case "3":
+                case "emergency":
+                    System.out.print("Enter road (example: South  or  South:FIRE East:POLICE): ");
+                    if (!sc.hasNextLine()) {
+                        running = false;
+                        break;
+                    }
+                    controller.requestEmergency(sc.nextLine());
+                    break;
+                case "4":
+                case "status":
+                    controller.status();
+                    break;
+                case "5":
+                case "exit":
+                    running = false;
+                    break;
+                default:
+                    System.out.println("Invalid choice.");
+            }
+        }
+
+        controller.save(DATA_FILE);
+        System.out.println("Goodbye.");
+    }
+}
